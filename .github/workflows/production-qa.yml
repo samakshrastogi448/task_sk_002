@@ -1,0 +1,36 @@
+name: Production QA
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      url:
+        description: Production URL
+        required: false
+        default: https://tasksk002.vercel.app
+jobs:
+  qa:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm install
+      - run: npx playwright install --with-deps chromium
+      - name: Wait for production
+        run: |
+          for i in {1..30}; do curl -fsS "${QA_URL}" >/dev/null && exit 0; sleep 10; done; exit 1
+        env:
+          QA_URL: ${{ github.event.inputs.url || 'https://tasksk002.vercel.app' }}
+      - run: npm run qa
+        env:
+          QA_URL: ${{ github.event.inputs.url || 'https://tasksk002.vercel.app' }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: production-qa-${{ github.sha }}
+          path: |
+            qa-report.json
+            qa-*.png
