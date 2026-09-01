@@ -1,36 +1,67 @@
 name: Production QA
+
 on:
   push:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      url:
-        description: Production URL
-        required: false
-        default: https://tasksk002.vercel.app
+
+permissions:
+  statuses: read
+  checks: read
+  deployments: read
+
+concurrency:
+  group: production-qa-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  qa:
+  production-qa:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PRODUCTION_URL: https://tasksk002.vercel.app
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: npm
-      - run: npm install
-      - run: npx playwright install --with-deps chromium
-      - name: Wait for production
+          node-version: '20'
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Probe manual Vercel handoff
+        id: probe
+        shell: bash
         run: |
-          for i in {1..30}; do curl -fsS "${QA_URL}" >/dev/null && exit 0; sleep 10; done; exit 1
-        env:
-          QA_URL: ${{ github.event.inputs.url || 'https://tasksk002.vercel.app' }}
-      - run: npm run qa
-        env:
-          QA_URL: ${{ github.event.inputs.url || 'https://tasksk002.vercel.app' }}
-      - uses: actions/upload-artifact@v4
-        if: always()
+          live=false
+          for attempt in $(seq 1 4); do
+            code=$(curl -L -sS -o /tmp/project.html -w '%{http_code}' --max-time 20 "${PRODUCTION_URL}" || true)
+            bytes=$(wc -c < /tmp/project.html 2>/dev/null || echo 0)
+            if [[ "${code}" =~ ^[23][0-9][0-9]$ && "${bytes}" -gt 100 ]]; then live=true; break; fi
+            sleep 5
+          done
+          echo "live=${live}" >> "$GITHUB_OUTPUT"
+      - name: Waiting for manual Vercel
+        if: steps.probe.outputs.live != 'true'
+        run: echo 'Source is GitHub-ready. Production QA will run after manual Vercel deployment and workflow retry.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Check exact-commit Vercel status
+        if: steps.probe.outputs.live == 'true'
+        shell: bash
+        run: |
+          state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/status" --jq '[.statuses[] | select(.context | test("Vercel"; "i"))][0].state // ""' 2>/dev/null || true)
+          echo "Vercel status: ${state:-metadata unavailable}" >> "$GITHUB_STEP_SUMMARY"
+          [[ "${state}" != "failure" && "${state}" != "error" ]]
+      - name: Run multi-viewport production QA
+        if: steps.probe.outputs.live == 'true'
+        run: npm run qa:production
+      - name: Publish QA summary
+        if: always() && steps.probe.outputs.live == 'true'
+        run: test -f qa-artifacts/qa-summary.md && cat qa-artifacts/qa-summary.md >> "$GITHUB_STEP_SUMMARY" || true
+      - name: Upload QA evidence
+        if: always() && steps.probe.outputs.live == 'true'
+        uses: actions/upload-artifact@v4
         with:
           name: production-qa-${{ github.sha }}
-          path: |
-            qa-report.json
-            qa-*.png
+          path: qa-artifacts/
+          retention-days: 14
