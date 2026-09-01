@@ -6,6 +6,8 @@ on:
   workflow_dispatch:
 
 permissions:
+  contents: write
+  actions: write
   statuses: read
   checks: read
   deployments: read
@@ -22,46 +24,97 @@ jobs:
       PRODUCTION_URL: https://tasksk002.vercel.app
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout verified source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - name: Install dependencies
-        run: npm install --no-audit --no-fund
+
+      - name: Detect tracked dependency lock
+        id: lock_state
+        shell: bash
+        run: |
+          if git ls-files --error-unmatch package-lock.json >/dev/null 2>&1; then
+            echo "tracked=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tracked=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install project and QA dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ steps.lock_state.outputs.tracked }}" == "true" ]]; then
+            npm ci --no-audit --no-fund
+          else
+            npm install --no-audit --no-fund
+          fi
+
+      - name: Bootstrap deterministic package lock
+        id: lock_bootstrap
+        if: steps.lock_state.outputs.tracked == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package-lock.json
+          git commit -m "Add deterministic dependency lock"
+          git push origin HEAD:main
+          echo "bootstrapped=true" >> "$GITHUB_OUTPUT"
+          echo "A deterministic package-lock.json was committed. Dispatching QA on the locked main commit." >> "$GITHUB_STEP_SUMMARY"
+          gh workflow run production-qa.yml --ref main
+
       - name: Install Chromium
+        if: steps.lock_bootstrap.outputs.bootstrapped != 'true'
         run: npx playwright install --with-deps chromium
-      - name: Probe manual Vercel handoff
+
+      - name: Probe production URL
+        if: steps.lock_bootstrap.outputs.bootstrapped != 'true'
         id: probe
         shell: bash
         run: |
           live=false
-          for attempt in $(seq 1 4); do
+          for attempt in $(seq 1 12); do
             code=$(curl -L -sS -o /tmp/project.html -w '%{http_code}' --max-time 20 "${PRODUCTION_URL}" || true)
             bytes=$(wc -c < /tmp/project.html 2>/dev/null || echo 0)
             if [[ "${code}" =~ ^[23][0-9][0-9]$ && "${bytes}" -gt 100 ]]; then live=true; break; fi
-            sleep 5
+            sleep 10
           done
           echo "live=${live}" >> "$GITHUB_OUTPUT"
-      - name: Waiting for manual Vercel
-        if: steps.probe.outputs.live != 'true'
-        run: echo 'Source is GitHub-ready. Production QA will run after manual Vercel deployment and workflow retry.' >> "$GITHUB_STEP_SUMMARY"
+          [[ "${live}" == "true" ]]
+
       - name: Check exact-commit Vercel status
-        if: steps.probe.outputs.live == 'true'
+        if: steps.lock_bootstrap.outputs.bootstrapped != 'true'
         shell: bash
         run: |
-          state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/status" --jq '[.statuses[] | select(.context | test("Vercel"; "i"))][0].state // ""' 2>/dev/null || true)
+          state=""
+          for attempt in $(seq 1 40); do
+            state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/status" --jq '[.statuses[] | select(.context | test("Vercel"; "i"))][0].state // ""' 2>/dev/null || true)
+            if [[ "${state}" == "success" ]]; then break; fi
+            if [[ "${state}" == "failure" || "${state}" == "error" ]]; then exit 1; fi
+            sleep 15
+          done
           echo "Vercel status: ${state:-metadata unavailable}" >> "$GITHUB_STEP_SUMMARY"
           [[ "${state}" != "failure" && "${state}" != "error" ]]
+
       - name: Run multi-viewport production QA
-        if: steps.probe.outputs.live == 'true'
+        if: steps.lock_bootstrap.outputs.bootstrapped != 'true'
         run: npm run qa:production
+
       - name: Publish QA summary
-        if: always() && steps.probe.outputs.live == 'true'
+        if: always() && steps.lock_bootstrap.outputs.bootstrapped != 'true'
         run: test -f qa-artifacts/qa-summary.md && cat qa-artifacts/qa-summary.md >> "$GITHUB_STEP_SUMMARY" || true
+
       - name: Upload QA evidence
-        if: always() && steps.probe.outputs.live == 'true'
+        if: always() && steps.lock_bootstrap.outputs.bootstrapped != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: production-qa-${{ github.sha }}
           path: qa-artifacts/
+          if-no-files-found: warn
           retention-days: 14
